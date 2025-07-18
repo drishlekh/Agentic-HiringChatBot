@@ -1,9 +1,7 @@
-# agent/nodes.py
-
+import os
 import json
 import datetime
 import random
-import os
 from dotenv import load_dotenv
 
 from langchain_groq import ChatGroq
@@ -14,32 +12,41 @@ from langchain_core.output_parsers import StrOutputParser
 from .state import AgentState
 from .tools import scrape_portfolio_tool
 
-# --- Pydantic imports for robust analysis ---
+# Pydantic models are the most reliable way to enforce output structure
 from enum import Enum
 from pydantic import BaseModel, Field
 from typing import List
 
+# We load our secret keys from the .env file right at the start.
 load_dotenv()
 
-# --- Core Setup ---
+# ==============================================================================
+# === Core Setup ===
+# ==============================================================================
 llm = ChatGroq(model="llama3-8b-8192", temperature=0)
 llm_with_tools = llm.bind_tools([scrape_portfolio_tool])
 
-# # --- Pydantic Schemas for Guaranteed Output Structure ---
-# class QuestionList(BaseModel):
-#     questions: List[str] = Field(description="A Python list containing exactly 5 question strings.")
+# ==============================================================================
+# === Pydantic Schemas for Guaranteed Output Structure ===
+# ==============================================================================
+class QuestionList(BaseModel):
+    """A Pydantic model to ensure the LLM returns a well-formed list of questions."""
+    questions: List[str] = Field(description="A Python list containing exactly 5 question strings.")
 
 class AnswerCategory(str, Enum):
+    """An Enum to define the only valid categories for answer classification."""
     NORMAL_ATTEMPT = "NORMAL_ATTEMPT"
     GAVE_UP = "GAVE_UP"
     UNPROFESSIONAL = "UNPROFESSIONAL"
 
 class AnswerAnalysis(BaseModel):
+    """A Pydantic model to ensure the answer analysis is always one of the valid categories."""
     category: AnswerCategory = Field(description="The single, most appropriate classification for the candidate's answer.")
 
-
-# --- Agent Nodes ---
-
+# ==============================================================================
+# === Agent Nodes ===
+# Each function below is a "node" in our agent's graph, representing a specific action.
+# ==============================================================================
 def entry_node(state: AgentState) -> dict:
     """The official starting point of our graph."""
     return {}
@@ -52,10 +59,7 @@ def call_scraper_tool_node(state: AgentState) -> dict:
     return {"messages": [response_with_tool_call]}
 
 def run_scraper_tool_node(state: AgentState) -> dict:
-    """
-    Executes the scrape_portfolio_tool and saves the scraped text back into
-    the agent's memory for later use.
-    """
+    """Executes the scrape_portfolio_tool and saves the scraped text back into memory."""
     last_message = state["messages"][-1]
     tool_call = last_message.tool_calls[0]
     scraped_content = scrape_portfolio_tool.invoke(tool_call["args"])
@@ -69,64 +73,25 @@ def handle_tool_error_node(state: AgentState) -> dict:
 
 def generate_questions_node(state: AgentState) -> dict:
     """
-    Generates all 5 questions by asking the LLM for a simple numbered list,
-    which is far more reliable than asking for complex JSON. The output is then
-    parsed reliably in Python.
+    Generates a tailored set of 5 questions, forcing the output into a reliable
+    list structure using Pydantic to prevent formatting errors.
     """
-    print("---NODE: GENERATING ALL QUESTIONS (SIMPLE TEXT METHOD)---")
     info = state["candidate_info"]
-    
-    # We will get a simple string as output.
-    parser = StrOutputParser()
-    
-    # This prompt is updated to be extremely clear and provide an example,
-    # making it much easier for the LLM to follow instructions.
+    structured_llm = llm.with_structured_output(QuestionList)
     generation_prompt = ChatPromptTemplate.from_template("""
     You are a senior tech recruiter. Based on the candidate's profile and scraped portfolio content,
-    generate exactly 5 interview questions.
-
-    **Candidate Profile:**
-    - Desired Position(s): {positions}
-    - Years of Experience: {experience}
-    - Tech Stack: {tech_stack}
-
-    **Scraped Portfolio Content:**
-    {project_context}
-
-    **Instructions:**
-    1.  Generate the **first 3 questions** based on their Tech Stack, Desired Position, and Years of Experience.
-    2.  Generate the **last 2 questions** based on specific projects or details found in their portfolio content.
-    3.  **IMPORTANT:** Respond ONLY with the 5 questions, formatted as a numbered list. Do not include any other text, greetings, or explanations.
-
-    Example Output:
-    1. What is your experience with Python?
-    2. How do you handle scaling in Django?
-    3. Describe a time you used Docker.
-    4. In your 'Project-X', can you explain the database schema?
-    5. What was the biggest challenge in your 'Project-Y'?
+    generate a list of exactly 5 interview questions.
+    - The first 3 questions should be based on their Tech Stack, Desired Position, and Experience.
+    - The last 2 questions should be based on specific projects found in their portfolio.
+    Candidate Profile: {profile}
+    Scraped Portfolio: {project_context}
     """)
-    
-    generation_chain = generation_prompt | llm | parser
-    
-    # The output from the chain is now a single block of plain text.
-    response_str = generation_chain.invoke({
-        "positions": info.get("desired_positions"),
-        "experience": info.get("years_of_experience"),
-        "tech_stack": ", ".join(info.get("tech_stack", [])),
-        "project_context": state["project_context"]
+    generation_chain = generation_prompt | structured_llm
+    questions_object = generation_chain.invoke({
+        "profile": json.dumps(info), "project_context": state["project_context"]
     })
-    
-    # We reliably parse this text into a clean list using Python's string methods.
-    # This splits the string by newlines and filters out any empty lines.
-    question_list = [line.strip() for line in response_str.splitlines() if line.strip()]
-    # This removes the numbering (e.g., "1. ", "2. ") from the start of each question.
-    cleaned_questions = [q.split('.', 1)[-1].strip() for q in question_list]
+    return {"interview_questions": questions_object.questions, "current_question_index": 0, "interview_log": []}
 
-    return {
-        "interview_questions": cleaned_questions,
-        "current_question_index": 0,
-        "interview_log": []
-    }
 def ask_question_node(state: AgentState) -> dict:
     """Manages the interview flow by asking one question at a time."""
     index = state.get("current_question_index", 0)
@@ -151,18 +116,15 @@ def log_answer_node(state: AgentState) -> dict:
     return {"interview_log": updated_log}
 
 def analyze_answer_node(state: AgentState) -> dict:
-    """
-    Analyzes the candidate's answer for tone and intent, forcing the output
-    into one of three reliable categories.
-    """
+    """Analyzes the candidate's answer for tone and intent."""
     index = state.get("current_question_index", 1)
     last_question = state["interview_questions"][index - 1]
     last_answer = state["messages"][-1].content
     structured_llm = llm.with_structured_output(AnswerAnalysis)
     analysis_prompt = ChatPromptTemplate.from_template("""
     You are a strict interview moderator. Classify the candidate's response into one of three categories: `NORMAL_ATTEMPT`, `GAVE_UP`, or `UNPROFESSIONAL`.
-    - `UNPROFESSIONAL` examples: "shut up", "what the hell", "this is dumb"
-    - `GAVE_UP` examples: "I don't know", "no idea", "skip this"
+    - `UNPROFESSIONAL` examples: "shut up", "what the hell"
+    - `GAVE_UP` examples: "I don't know", "skip this"
     - `NORMAL_ATTEMPT` is for any other genuine answer.
     The question was: "{question}"
     The candidate's answer is: "{answer}"
@@ -188,22 +150,19 @@ def handle_unprofessional_node(state: AgentState) -> dict:
     reply = "A professional tone is expected during this assessment. Unprofessional language will be noted. Let's proceed to the next question."
     return {"messages": [AIMessage(content=reply)]}
 
-# --- THIS IS THE UPDATED SCORECARD NODE ---
+# --- THIS IS THE DEFINITIVE, CORRECTED SCORECARD NODE ---
 def generate_scorecard_node(state: AgentState) -> dict:
     """
-    Generates the final scorecard and saves it directly to a file in the
-    'scorecards' directory, ensuring the directory exists first.
+    Generates the final scorecard and saves it to a file in the 'scorecards'
+    directory, ensuring the directory exists first. This is crucial for cloud deployments.
     """
     print("---NODE: GENERATING AND SAVING SCORECARD---")
 
-    # --- THIS IS THE KEY FIX FOR STREAMLIT CLOUD ---
-    # 1. Define the directory path.
+    # This is the key fix: programmatically create the directory if it doesn't exist.
     output_dir = "scorecards"
-    
-    # 2. Check if the directory exists. If not, create it. This is safe to run every time.
     os.makedirs(output_dir, exist_ok=True)
     
-    # Generate the scorecard content as before.
+    # Generate the scorecard content.
     interview_summary = "\n\n".join(f"Question: {item['question']}\nAnswer: {item['answer']}" for item in state["interview_log"])
     scorecard_prompt = ChatPromptTemplate.from_template("""
     You are a senior hiring manager. Write a detailed candidate scorecard based on the transcript.
@@ -227,13 +186,16 @@ def generate_scorecard_node(state: AgentState) -> dict:
         
     print(f"---Scorecard saved to: {filename}---")
     
-    # Return an empty dictionary as this node's main job is the side effect of saving a file.
+    # This node's main job is the side effect of saving a file.
     return {}
 
 def end_conversation_node(state: AgentState) -> dict:
     """Provides a polite closing message to the candidate and ends the interview."""
     end_message = AIMessage(content="Thank you very much for your time. Your initial screening is now complete. Our recruitment team will review your profile and the results, and will get in touch with you regarding the next steps. Have a wonderful day!")
     return {"messages": [end_message], "interview_finished": True}
+
+
+
 
 
 
