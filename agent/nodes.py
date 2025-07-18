@@ -1,4 +1,4 @@
-
+import os
 import json
 import datetime
 import random
@@ -216,27 +216,70 @@ def handle_unprofessional_node(state: AgentState) -> dict:
 
 
 
+# def generate_scorecard_node(state: AgentState) -> dict:
+#     """
+#     At the end of the interview, this node gathers all the collected information
+#     and the interview log. It then uses the LLM to write a comprehensive,
+#     professional scorecard for the human recruiter to review.
+#     """
+#     interview_summary = "\n\n".join(f"Question: {item['question']}\nAnswer: {item['answer']}" for item in state["interview_log"])
+#     scorecard_prompt = ChatPromptTemplate.from_template("""
+#     You are a senior hiring manager. Write a detailed candidate scorecard based on the transcript.
+#     **Candidate Info:** {candidate_info}
+#     **Interview Transcript:** {interview_summary}
+#     **Task:** Produce a formal scorecard with: 1. Overall Summary, 2. Technical Proficiency, 
+#     3. Project Acumen, 4. Communication & Professionalism, 5. Recommendation.
+#     """)
+#     scorecard_chain = scorecard_prompt | llm | StrOutputParser()
+#     scorecard_content = scorecard_chain.invoke({"candidate_info": json.dumps(state["candidate_info"]), "interview_summary": interview_summary})
+#     candidate_name = state["candidate_info"].get("full_name", "unknown").replace(" ", "_")
+#     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+#     filename = f"scorecards/{candidate_name}_{timestamp}.md"
+#     with open(filename, "w", encoding="utf-8") as f: f.write(scorecard_content)
+#     return {}
+
+
 def generate_scorecard_node(state: AgentState) -> dict:
     """
-    At the end of the interview, this node gathers all the collected information
-    and the interview log. It then uses the LLM to write a comprehensive,
-    professional scorecard for the human recruiter to review.
+    Generates the final scorecard for the recruiter, ensuring the output
+    directory exists before saving the file.
     """
+    print("---NODE: GENERATING SCORECARD---")
+
+    
+    # 1. Define the directory path.
+    output_dir = "scorecards"
+    
+    # 2. Check if the directory exists. If not, create it.
+    # The `os.makedirs` function can create a directory, and `exist_ok=True`
+    # prevents an error if the directory already exists. This makes the
+    # operation safe to run every time.
+    os.makedirs(output_dir, exist_ok=True)
+    
+   
     interview_summary = "\n\n".join(f"Question: {item['question']}\nAnswer: {item['answer']}" for item in state["interview_log"])
     scorecard_prompt = ChatPromptTemplate.from_template("""
     You are a senior hiring manager. Write a detailed candidate scorecard based on the transcript.
     **Candidate Info:** {candidate_info}
     **Interview Transcript:** {interview_summary}
-    **Task:** Produce a formal scorecard with: 1. Overall Summary, 2. Technical Proficiency, 
-    3. Project Acumen, 4. Communication & Professionalism, 5. Recommendation.
+    **Task:** Produce a formal scorecard with: 1. Summary, 2. Technical Proficiency, 3. Project Acumen, 4. Professionalism, 5. Recommendation.
     """)
-    scorecard_chain = scorecard_prompt | llm | StrOutputParser()
-    scorecard_content = scorecard_chain.invoke({"candidate_info": json.dumps(state["candidate_info"]), "interview_summary": interview_summary})
+    scorecard_chain = scorecard_prompt | llm
+    scorecard_content = scorecard_chain.invoke({"candidate_info": json.dumps(state["candidate_info"]), "interview_summary": interview_summary}).content
+    
     candidate_name = state["candidate_info"].get("full_name", "unknown").replace(" ", "_")
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-    filename = f"scorecards/{candidate_name}_{timestamp}.md"
-    with open(filename, "w", encoding="utf-8") as f: f.write(scorecard_content)
+    
+    # We now construct the full path using our defined output directory.
+    filename = os.path.join(output_dir, f"{candidate_name}_{timestamp}.md")
+    
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(scorecard_content)
+        
+    print(f"---Scorecard saved to {filename}---")
     return {}
+
+
 
 def end_conversation_node(state: AgentState) -> dict:
     """
