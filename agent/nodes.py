@@ -25,9 +25,9 @@ load_dotenv()
 llm = ChatGroq(model="llama3-8b-8192", temperature=0)
 llm_with_tools = llm.bind_tools([scrape_portfolio_tool])
 
-# --- Pydantic Schemas for Guaranteed Output Structure ---
-class QuestionList(BaseModel):
-    questions: List[str] = Field(description="A Python list containing exactly 5 question strings.")
+# # --- Pydantic Schemas for Guaranteed Output Structure ---
+# class QuestionList(BaseModel):
+#     questions: List[str] = Field(description="A Python list containing exactly 5 question strings.")
 
 class AnswerCategory(str, Enum):
     NORMAL_ATTEMPT = "NORMAL_ATTEMPT"
@@ -69,30 +69,64 @@ def handle_tool_error_node(state: AgentState) -> dict:
 
 def generate_questions_node(state: AgentState) -> dict:
     """
-    Uses the candidate's profile to generate a tailored set of 5 questions,
-    forcing the output into a reliable list structure using Pydantic.
+    Generates all 5 questions by asking the LLM for a simple numbered list,
+    which is far more reliable than asking for complex JSON. The output is then
+    parsed reliably in Python.
     """
+    print("---NODE: GENERATING ALL QUESTIONS (SIMPLE TEXT METHOD)---")
     info = state["candidate_info"]
-    structured_llm = llm.with_structured_output(QuestionList)
+    
+    # We will get a simple string as output.
+    parser = StrOutputParser()
+    
+    # This prompt is updated to be extremely clear and provide an example,
+    # making it much easier for the LLM to follow instructions.
     generation_prompt = ChatPromptTemplate.from_template("""
     You are a senior tech recruiter. Based on the candidate's profile and scraped portfolio content,
-    generate a list of exactly 5 interview questions.
-    - First 3 questions: Based on their Tech Stack, Desired Position, and Experience.
-    - Last 2 questions: Based on specific projects in their portfolio.
-    
-    Candidate Profile: {profile}
-    Scraped Portfolio: {project_context}
+    generate exactly 5 interview questions.
+
+    **Candidate Profile:**
+    - Desired Position(s): {positions}
+    - Years of Experience: {experience}
+    - Tech Stack: {tech_stack}
+
+    **Scraped Portfolio Content:**
+    {project_context}
+
+    **Instructions:**
+    1.  Generate the **first 3 questions** based on their Tech Stack, Desired Position, and Years of Experience.
+    2.  Generate the **last 2 questions** based on specific projects or details found in their portfolio content.
+    3.  **IMPORTANT:** Respond ONLY with the 5 questions, formatted as a numbered list. Do not include any other text, greetings, or explanations.
+
+    Example Output:
+    1. What is your experience with Python?
+    2. How do you handle scaling in Django?
+    3. Describe a time you used Docker.
+    4. In your 'Project-X', can you explain the database schema?
+    5. What was the biggest challenge in your 'Project-Y'?
     """)
-    generation_chain = generation_prompt | structured_llm
-    questions_object = generation_chain.invoke({
-        "profile": json.dumps(info), "project_context": state["project_context"]
+    
+    generation_chain = generation_prompt | llm | parser
+    
+    # The output from the chain is now a single block of plain text.
+    response_str = generation_chain.invoke({
+        "positions": info.get("desired_positions"),
+        "experience": info.get("years_of_experience"),
+        "tech_stack": ", ".join(info.get("tech_stack", [])),
+        "project_context": state["project_context"]
     })
+    
+    # We reliably parse this text into a clean list using Python's string methods.
+    # This splits the string by newlines and filters out any empty lines.
+    question_list = [line.strip() for line in response_str.splitlines() if line.strip()]
+    # This removes the numbering (e.g., "1. ", "2. ") from the start of each question.
+    cleaned_questions = [q.split('.', 1)[-1].strip() for q in question_list]
+
     return {
-        "interview_questions": questions_object.questions,
+        "interview_questions": cleaned_questions,
         "current_question_index": 0,
         "interview_log": []
     }
-
 def ask_question_node(state: AgentState) -> dict:
     """Manages the interview flow by asking one question at a time."""
     index = state.get("current_question_index", 0)
