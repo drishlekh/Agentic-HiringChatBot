@@ -12,10 +12,9 @@ from langchain_core.output_parsers import StrOutputParser
 from .state import AgentState
 from .tools import scrape_portfolio_tool
 
-# Pydantic models are the most reliable way to enforce output structure
+# Pydantic models are used ONLY for the analysis step, where they are most effective.
 from enum import Enum
 from pydantic import BaseModel, Field
-from typing import List
 
 # We load our secret keys from the .env file right at the start.
 load_dotenv()
@@ -27,20 +26,14 @@ llm = ChatGroq(model="llama3-8b-8192", temperature=0)
 llm_with_tools = llm.bind_tools([scrape_portfolio_tool])
 
 # ==============================================================================
-# === Pydantic Schemas for Guaranteed Output Structure ===
+# === Pydantic Schemas for Answer Analysis ===
 # ==============================================================================
-class QuestionList(BaseModel):
-    """A Pydantic model to ensure the LLM returns a well-formed list of questions."""
-    questions: List[str] = Field(description="A Python list containing exactly 5 question strings.")
-
 class AnswerCategory(str, Enum):
-    """An Enum to define the only valid categories for answer classification."""
     NORMAL_ATTEMPT = "NORMAL_ATTEMPT"
     GAVE_UP = "GAVE_UP"
     UNPROFESSIONAL = "UNPROFESSIONAL"
 
 class AnswerAnalysis(BaseModel):
-    """A Pydantic model to ensure the answer analysis is always one of the valid categories."""
     category: AnswerCategory = Field(description="The single, most appropriate classification for the candidate's answer.")
 
 # ==============================================================================
@@ -71,26 +64,56 @@ def handle_tool_error_node(state: AgentState) -> dict:
     error_message = AIMessage(content="It appears the GitHub or portfolio link you provided is invalid or unreachable. Please restart the screening process with a valid URL.")
     return {"messages": [error_message], "interview_finished": True}
 
+# --- THIS IS THE DEFINITIVE, ROBUST VERSION OF THE QUESTION GENERATOR ---
 def generate_questions_node(state: AgentState) -> dict:
     """
-    Generates a tailored set of 5 questions, forcing the output into a reliable
-    list structure using Pydantic to prevent formatting errors.
+    Generates all 5 questions by asking the LLM for a simple numbered list,
+    which is far more reliable than asking for complex JSON. The output is then
+    parsed reliably in Python.
     """
+    print("---NODE: GENERATING ALL QUESTIONS (SIMPLE TEXT METHOD)---")
     info = state["candidate_info"]
-    structured_llm = llm.with_structured_output(QuestionList)
+    parser = StrOutputParser()
+    
     generation_prompt = ChatPromptTemplate.from_template("""
     You are a senior tech recruiter. Based on the candidate's profile and scraped portfolio content,
-    generate a list of exactly 5 interview questions.
-    - The first 3 questions should be based on their Tech Stack, Desired Position, and Experience.
-    - The last 2 questions should be based on specific projects found in their portfolio.
-    Candidate Profile: {profile}
-    Scraped Portfolio: {project_context}
+    generate exactly 5 interview questions.
+
+    **Candidate Profile:**
+    - Desired Position(s): {positions}
+    - Years of Experience: {experience}
+    - Tech Stack: {tech_stack}
+
+    **Scraped Portfolio Content:**
+    {project_context}
+
+    **Instructions:**
+    1.  Generate the **first 3 questions** based on their Tech Stack, Desired Position, and Experience.
+    2.  Generate the **last 2 questions** based on specific projects or details found in their portfolio content.
+    3.  **IMPORTANT:** Respond ONLY with the 5 questions, formatted as a numbered list. Do not include any other text, greetings, or explanations.
+
+    Example Output:
+    1. What is your experience with Python?
+    2. In your 'Project-X', can you explain the database schema?
     """)
-    generation_chain = generation_prompt | structured_llm
-    questions_object = generation_chain.invoke({
-        "profile": json.dumps(info), "project_context": state["project_context"]
+    
+    generation_chain = generation_prompt | llm | parser
+    response_str = generation_chain.invoke({
+        "positions": info.get("desired_positions"),
+        "experience": info.get("years_of_experience"),
+        "tech_stack": ", ".join(info.get("tech_stack", [])),
+        "project_context": state["project_context"]
     })
-    return {"interview_questions": questions_object.questions, "current_question_index": 0, "interview_log": []}
+    
+    # We reliably parse the text into a clean list using Python's string methods.
+    question_list = [line.strip() for line in response_str.splitlines() if line.strip()]
+    cleaned_questions = [q.split('.', 1)[-1].strip() for q in question_list]
+
+    return {
+        "interview_questions": cleaned_questions,
+        "current_question_index": 0,
+        "interview_log": []
+    }
 
 def ask_question_node(state: AgentState) -> dict:
     """Manages the interview flow by asking one question at a time."""
@@ -150,19 +173,15 @@ def handle_unprofessional_node(state: AgentState) -> dict:
     reply = "A professional tone is expected during this assessment. Unprofessional language will be noted. Let's proceed to the next question."
     return {"messages": [AIMessage(content=reply)]}
 
-# --- THIS IS THE DEFINITIVE, CORRECTED SCORECARD NODE ---
 def generate_scorecard_node(state: AgentState) -> dict:
     """
-    Generates the final scorecard and saves it to a file in the 'scorecards'
-    directory, ensuring the directory exists first. This is crucial for cloud deployments.
+    Generates the final scorecard and saves it to a file, ensuring the
+    'scorecards' directory exists first.
     """
     print("---NODE: GENERATING AND SAVING SCORECARD---")
-
-    # This is the key fix: programmatically create the directory if it doesn't exist.
     output_dir = "scorecards"
     os.makedirs(output_dir, exist_ok=True)
     
-    # Generate the scorecard content.
     interview_summary = "\n\n".join(f"Question: {item['question']}\nAnswer: {item['answer']}" for item in state["interview_log"])
     scorecard_prompt = ChatPromptTemplate.from_template("""
     You are a senior hiring manager. Write a detailed candidate scorecard based on the transcript.
@@ -176,26 +195,17 @@ def generate_scorecard_node(state: AgentState) -> dict:
     
     candidate_name = state["candidate_info"].get("full_name", "unknown").replace(" ", "_")
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-    
-    # Construct the full file path.
     filename = os.path.join(output_dir, f"{candidate_name}_{timestamp}.md")
     
-    # Write the content to the file.
     with open(filename, "w", encoding="utf-8") as f:
         f.write(scorecard_content)
-        
     print(f"---Scorecard saved to: {filename}---")
-    
-    # This node's main job is the side effect of saving a file.
     return {}
 
 def end_conversation_node(state: AgentState) -> dict:
     """Provides a polite closing message to the candidate and ends the interview."""
     end_message = AIMessage(content="Thank you very much for your time. Your initial screening is now complete. Our recruitment team will review your profile and the results, and will get in touch with you regarding the next steps. Have a wonderful day!")
     return {"messages": [end_message], "interview_finished": True}
-
-
-
 
 
 
