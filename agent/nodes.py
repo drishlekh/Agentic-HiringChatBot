@@ -12,10 +12,6 @@ from langchain_core.output_parsers import StrOutputParser
 from .state import AgentState
 from .tools import scrape_portfolio_tool
 
-# Pydantic models are used ONLY for the analysis step, where they are most effective.
-from enum import Enum
-from pydantic import BaseModel, Field
-
 # We load our secret keys from the .env file right at the start.
 load_dotenv()
 
@@ -25,21 +21,12 @@ load_dotenv()
 llm = ChatGroq(model="llama3-8b-8192", temperature=0)
 llm_with_tools = llm.bind_tools([scrape_portfolio_tool])
 
-# ==============================================================================
-# === Pydantic Schemas for Answer Analysis ===
-# ==============================================================================
-class AnswerCategory(str, Enum):
-    NORMAL_ATTEMPT = "NORMAL_ATTEMPT"
-    GAVE_UP = "GAVE_UP"
-    UNPROFESSIONAL = "UNPROFESSIONAL"
-
-class AnswerAnalysis(BaseModel):
-    category: AnswerCategory = Field(description="The single, most appropriate classification for the candidate's answer.")
 
 # ==============================================================================
 # === Agent Nodes ===
 # Each function below is a "node" in our agent's graph, representing a specific action.
 # ==============================================================================
+
 def entry_node(state: AgentState) -> dict:
     """The official starting point of our graph."""
     return {}
@@ -64,7 +51,6 @@ def handle_tool_error_node(state: AgentState) -> dict:
     error_message = AIMessage(content="It appears the GitHub or portfolio link you provided is invalid or unreachable. Please restart the screening process with a valid URL.")
     return {"messages": [error_message], "interview_finished": True}
 
-# --- THIS IS THE DEFINITIVE, ROBUST VERSION OF THE QUESTION GENERATOR ---
 def generate_questions_node(state: AgentState) -> dict:
     """
     Generates all 5 questions by asking the LLM for a simple numbered list,
@@ -91,10 +77,6 @@ def generate_questions_node(state: AgentState) -> dict:
     1.  Generate the **first 3 questions** based on their Tech Stack, Desired Position, and Experience.
     2.  Generate the **last 2 questions** based on specific projects or details found in their portfolio content.
     3.  **IMPORTANT:** Respond ONLY with the 5 questions, formatted as a numbered list. Do not include any other text, greetings, or explanations.
-
-    Example Output:
-    1. What is your experience with Python?
-    2. In your 'Project-X', can you explain the database schema?
     """)
     
     generation_chain = generation_prompt | llm | parser
@@ -105,7 +87,6 @@ def generate_questions_node(state: AgentState) -> dict:
         "project_context": state["project_context"]
     })
     
-    # We reliably parse the text into a clean list using Python's string methods.
     question_list = [line.strip() for line in response_str.splitlines() if line.strip()]
     cleaned_questions = [q.split('.', 1)[-1].strip() for q in question_list]
 
@@ -138,23 +119,44 @@ def log_answer_node(state: AgentState) -> dict:
     updated_log = state.get("interview_log", []) + [current_log]
     return {"interview_log": updated_log}
 
+# --- THIS IS THE DEFINITIVE, ROBUST VERSION OF THE ANALYSIS NODE ---
 def analyze_answer_node(state: AgentState) -> dict:
-    """Analyzes the candidate's answer for tone and intent."""
+    """
+    Analyzes the user's answer for tone and intent by asking the LLM for a
+    single-word response, which is the most reliable method.
+    """
+    print("---NODE: ANALYZING ANSWER (SIMPLE TEXT METHOD)---")
     index = state.get("current_question_index", 1)
     last_question = state["interview_questions"][index - 1]
     last_answer = state["messages"][-1].content
-    structured_llm = llm.with_structured_output(AnswerAnalysis)
+    
+    parser = StrOutputParser()
     analysis_prompt = ChatPromptTemplate.from_template("""
-    You are a strict interview moderator. Classify the candidate's response into one of three categories: `NORMAL_ATTEMPT`, `GAVE_UP`, or `UNPROFESSIONAL`.
-    - `UNPROFESSIONAL` examples: "shut up", "what the hell"
-    - `GAVE_UP` examples: "I don't know", "skip this"
-    - `NORMAL_ATTEMPT` is for any other genuine answer.
-    The question was: "{question}"
+    You are a strict interview moderator. Your sole job is to analyze a candidate's response and classify it into one of three categories.
+
+    **Category Definitions & Examples:**
+    - `NORMAL_ATTEMPT`: A genuine effort to answer, regardless of correctness. (e.g., "I think I would use a load balancer.")
+    - `GAVE_UP`: An explicit refusal to answer. (e.g., "I don't know," "no idea," "skip this one")
+    - `UNPROFESSIONAL`: Any response containing rude language, slang, insults, or is aggressively off-topic. (e.g., "shut up," "what the hell," "this is dumb")
+
+    **Task:**
+    Classify the following answer based on the rules and examples above.
+    The interview question was: "{question}"
     The candidate's answer is: "{answer}"
+
+    **IMPORTANT: Respond ONLY with the single category name in uppercase (NORMAL_ATTEMPT, GAVE_UP, or UNPROFESSIONAL) and absolutely nothing else.**
     """)
-    analysis_chain = analysis_prompt | structured_llm
-    analysis_object = analysis_chain.invoke({"question": last_question, "answer": last_answer})
-    category = analysis_object.category.value
+    
+    analysis_chain = analysis_prompt | llm | parser
+    category = analysis_chain.invoke({"question": last_question, "answer": last_answer}).strip()
+    
+    # This is a safety net. If the model still fails to follow instructions,
+    # we default to a safe category to prevent the app from crashing.
+    if category not in ["NORMAL_ATTEMPT", "GAVE_UP", "UNPROFESSIONAL"]:
+        print(f"---WARNING: LLM returned an invalid category: '{category}'. Defaulting to NORMAL_ATTEMPT.---")
+        category = "NORMAL_ATTEMPT"
+    
+    print(f"---Answer classified as: {category}---")
     return {"last_answer_category": category}
 
 def give_acknowledgement_node(state: AgentState) -> dict:
