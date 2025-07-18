@@ -34,8 +34,8 @@ Follow these steps to set up and run the application on your local machine.
 Clone this project to your local machine.
 
 ```bash
-git clone <your-repository-url>
-cd <repository-name>
+git clone https://github.com/drishlekh/Agentic-HiringChatBot
+cd Agentic-HiringChatBot
 ```
 
 #### Step 2: Set Up a Virtual Environment
