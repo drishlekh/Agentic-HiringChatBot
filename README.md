@@ -95,7 +95,7 @@ The application should now be running and accessible in your web browser at `htt
 4.  On the confirmation screen, review the instructions and click **"I am ready, Start the Technical Test"** when you are prepared.
 5.  **Answer the 5 questions** presented by the AI assistant one by one in the chat interface.
 6.  Upon completion, you will see a final success message.
-7.  **(For Developers)** A detailed Markdown scorecard for the completed interview will be generated and saved in the `scorecards/` directory.
+7.  **(For Developers/HRs/Hiring Team)** A detailed Markdown scorecard for the completed interview will be generated and saved in the `scorecards/` directory.
 
 ## Technical Details
 
